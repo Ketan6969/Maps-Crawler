@@ -6,12 +6,30 @@ const delay_1 = require("../utils/delay");
 const scrapeGoogleMaps = async (context, query, limit = 20) => {
     const page = await context.newPage();
     const results = [];
-    const minDelay = parseInt(process.env.SCRAPER_DELAY_MIN || '1000', 10);
-    const maxDelay = parseInt(process.env.SCRAPER_DELAY_MAX || '3000', 10);
+    // Rate limiting & Interaction simulation setup
+    const minDelay = parseInt(process.env.SCRAPER_DELAY_MIN || '2000', 10);
+    const maxDelay = parseInt(process.env.SCRAPER_DELAY_MAX || '6000', 10);
+    // Big initial wait for rate limiting searches
+    const searchDelayMin = 5000;
+    const searchDelayMax = 10000;
     try {
         console.log(`[Scraper] Starting scrape for query: "${query}" (limit: ${limit})`);
-        // 1. Navigate to Google Maps
-        await page.goto('https://www.google.com/maps', { waitUntil: 'domcontentloaded' });
+        // Rate limit starting actions
+        await (0, delay_1.randomDelay)(searchDelayMin, searchDelayMax);
+        // 1. Navigate to Google Maps (with retry for flaky Chromium network changes)
+        let loaded = false;
+        for (let attempt = 0; attempt < 3 && !loaded; attempt++) {
+            try {
+                await page.goto('https://www.google.com/maps', { waitUntil: 'domcontentloaded', timeout: 30000 });
+                loaded = true;
+            }
+            catch (e) {
+                console.warn(`[Scraper] Network load issue (attempt ${attempt + 1}): ${e.message}`);
+                await (0, delay_1.randomDelay)(2000, 4000);
+            }
+        }
+        if (!loaded)
+            throw new Error("Failed to load Google Maps after 3 attempts");
         await (0, delay_1.randomDelay)(minDelay, maxDelay);
         // Accept cookies if present
         try {
@@ -25,13 +43,31 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
         // 2. Search for the query
         const searchbox = page.locator('input#searchboxinput, input[name="q"]').first();
         await searchbox.waitFor({ state: 'visible', timeout: 10000 });
+        // Move mouse to search box before clicking
+        const bbSearch = await searchbox.boundingBox();
+        if (bbSearch) {
+            await page.mouse.move(bbSearch.x + bbSearch.width / 2, bbSearch.y + bbSearch.height / 2, { steps: 5 });
+            await (0, delay_1.randomDelay)(300, 800);
+        }
+        // Type slowly like a human
         await searchbox.fill(query);
-        await (0, delay_1.randomDelay)(500, 1000);
+        await (0, delay_1.randomDelay)(500, 1500);
         await page.keyboard.press('Enter');
         console.log(`[Scraper] Search submitted. Waiting for results panel.`);
-        // 3. Wait for the results pane to load.
+        // 3. Wait for the results pane to load, or handle "No results" gracefully.
         const feed = page.locator('div[role="feed"]');
-        await feed.waitFor({ state: 'attached', timeout: 15000 });
+        try {
+            await feed.waitFor({ state: 'attached', timeout: 10000 });
+        }
+        catch (e) {
+            console.log(`[Scraper] Results feed did not load. Checking for empty state...`);
+            const noResults = page.locator('text="Google Maps can\'t find"');
+            if (await noResults.isVisible()) {
+                console.log(`[Scraper] Empty results confirmed.`);
+                return []; // Return empty array naturally
+            }
+            throw new Error("Timeout waiting for feed panel to attach.");
+        }
         await (0, delay_1.randomDelay)(minDelay, maxDelay);
         // 4. Scroll and collect URLs and partial data from the feed
         const placesMap = new Map();
@@ -39,6 +75,15 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
         while (placesMap.size < limit && retries < 5) {
             const itemSelector = 'div[role="feed"] a[href*="/maps/place/"]';
             const locators = await page.locator(itemSelector).all();
+            if (locators.length === 0) {
+                console.log(`[Scraper] 0 locators found. Dumping HTML for debugging.`);
+                try {
+                    await page.screenshot({ path: '/tmp/scraper-debug-screenshot.png' });
+                    const html = await feed.innerHTML();
+                    require('fs').writeFileSync('/tmp/scraper-debug-feed.html', html);
+                }
+                catch (e) { }
+            }
             let added = false;
             for (let i = 0; i < locators.length; i++) {
                 const freshLocators = await page.locator(itemSelector).all();
@@ -56,7 +101,9 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
                         placesMap.set(href, baseData);
                         added = true;
                     }
-                    catch (e) { /* ignore parse error for one card */ }
+                    catch (e) {
+                        console.error(`[Scraper] Base extracted failed for locator:`, e);
+                    }
                 }
                 if (placesMap.size >= limit)
                     break;
@@ -64,11 +111,22 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
             console.log(`[Scraper] Discovered ${placesMap.size}/${limit} places from feed...`);
             if (placesMap.size >= limit)
                 break;
-            // Scroll down the feed
+            // Scroll down the feed smoothly and human-like
             const feedHandle = await feed.elementHandle();
             if (feedHandle) {
                 const prevHeight = await feedHandle.evaluate(node => node.scrollHeight);
-                await feedHandle.evaluate(node => node.scrollBy(0, 1500));
+                // Human scrolling simulation inside the feed
+                const scrollAmount = 1500;
+                const steps = 4;
+                for (let s = 0; s < steps; s++) {
+                    await feedHandle.evaluate((node, stepSize) => node.scrollBy(0, stepSize), scrollAmount / steps);
+                    // Randomly wiggle mouse to appear active
+                    const rx = Math.floor(Math.random() * 800) + 100;
+                    const ry = Math.floor(Math.random() * 600) + 100;
+                    await page.mouse.move(rx, ry, { steps: 3 });
+                    await (0, delay_1.randomDelay)(200, 600);
+                }
+                // Pause after full scroll
                 await (0, delay_1.randomDelay)(minDelay, maxDelay);
                 const newHeight = await feedHandle.evaluate(node => node.scrollHeight);
                 const endIndicator = page.locator('text="You\'ve reached the end of the list."');

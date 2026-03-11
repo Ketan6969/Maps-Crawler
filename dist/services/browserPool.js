@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.browserPool = void 0;
 const playwright_1 = require("playwright");
 const randomUserAgent_1 = require("../utils/randomUserAgent");
+const stealth_1 = require("../utils/stealth");
 const DEFAULT_CONFIG = {
     maxBrowsers: parseInt(process.env.MAX_BROWSERS || '3', 10),
     maxJobsPerBrowser: 50, // Restart browser after this many jobs to prevent memory leaks
@@ -31,8 +32,14 @@ class BrowserPool {
      * Creates a single browser and context pair and adds to the pool.
      */
     async createBrowserInstance() {
+        const proxyConfig = process.env.PROXY_SERVER ? {
+            server: process.env.PROXY_SERVER,
+            username: process.env.PROXY_USERNAME,
+            password: process.env.PROXY_PASSWORD
+        } : undefined;
         const browser = await playwright_1.chromium.launch({
             headless: process.env.HEADLESS !== 'false',
+            proxy: proxyConfig,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -40,20 +47,21 @@ class BrowserPool {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled'
             ]
         });
         const context = await browser.newContext({
             userAgent: (0, randomUserAgent_1.getRandomUserAgent)(),
-            viewport: { width: 1280, height: 800 },
+            viewport: { width: 1366, height: 768 },
             deviceScaleFactor: 1,
-            locale: 'en-US',
+            locale: 'en-IN',
+            timezoneId: 'Asia/Kolkata',
+            geolocation: { longitude: 77.2090, latitude: 28.6139 },
             permissions: ['geolocation']
         });
-        // Mask webdriver
-        await context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        });
+        // Mask webdriver and inject stealth properties
+        await context.addInitScript(stealth_1.stealthScript);
         this.browsers.push({
             browser,
             context,

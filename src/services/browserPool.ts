@@ -1,5 +1,6 @@
 import { chromium, Browser, BrowserContext } from 'playwright';
 import { getRandomUserAgent } from '../utils/randomUserAgent';
+import { stealthScript } from '../utils/stealth';
 
 interface PoolConfig {
     maxBrowsers: number;
@@ -46,8 +47,15 @@ class BrowserPool {
      * Creates a single browser and context pair and adds to the pool.
      */
     private async createBrowserInstance() {
+        const proxyConfig = process.env.PROXY_SERVER ? {
+            server: process.env.PROXY_SERVER,
+            username: process.env.PROXY_USERNAME,
+            password: process.env.PROXY_PASSWORD
+        } : undefined;
+
         const browser = await chromium.launch({
             headless: process.env.HEADLESS !== 'false',
+            proxy: proxyConfig,
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -55,22 +63,23 @@ class BrowserPool {
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
                 '--no-zygote',
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled'
             ]
         });
 
         const context = await browser.newContext({
             userAgent: getRandomUserAgent(),
-            viewport: { width: 1280, height: 800 },
+            viewport: { width: 1366, height: 768 },
             deviceScaleFactor: 1,
-            locale: 'en-US',
+            locale: 'en-IN',
+            timezoneId: 'Asia/Kolkata',
+            geolocation: { longitude: 77.2090, latitude: 28.6139 },
             permissions: ['geolocation']
         });
 
-        // Mask webdriver
-        await context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        });
+        // Mask webdriver and inject stealth properties
+        await context.addInitScript(stealthScript);
 
         this.browsers.push({
             browser,

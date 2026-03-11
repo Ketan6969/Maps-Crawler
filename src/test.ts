@@ -9,7 +9,7 @@ async function test() {
     const context = await browserPool.acquireContext();
     try {
         console.log("Scraping...");
-        const results = await scrapeGoogleMaps(context, "restaurant in vadodara, India", 5);
+        const results = await scrapeGoogleMaps(context, "mobile repair in Vadodara, India", 2);
         console.log("Scrape successful. Results:");
         console.log(JSON.stringify(results, null, 2));
     } catch (e) {
