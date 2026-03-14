@@ -1,9 +1,15 @@
 "use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.scrapeGoogleMaps = void 0;
+const p_queue_1 = __importDefault(require("p-queue"));
 const parser_1 = require("../utils/parser");
 const delay_1 = require("../utils/delay");
-const scrapeGoogleMaps = async (context, query, limit = 20) => {
+const logger_1 = require("../utils/logger");
+const metrics_1 = require("../services/metrics");
+const scrapeGoogleMaps = async (context, query, limit = 20, jobId) => {
     const page = await context.newPage();
     const results = [];
     // Rate limiting & Interaction simulation setup
@@ -13,23 +19,30 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
     const searchDelayMin = 5000;
     const searchDelayMax = 10000;
     try {
+        logger_1.logger.info('crawl_started', 'google.com', jobId, { query, limit });
         console.log(`[Scraper] Starting scrape for query: "${query}" (limit: ${limit})`);
+        metrics_1.metricsService.incrementRequest('google.com'); // Track domain rate on main maps search
         // Rate limit starting actions
         await (0, delay_1.randomDelay)(searchDelayMin, searchDelayMax);
         // 1. Navigate to Google Maps (with retry for flaky Chromium network changes)
         let loaded = false;
         for (let attempt = 0; attempt < 3 && !loaded; attempt++) {
             try {
+                metrics_1.metricsService.incrementRequest('google.com'); // Increment on retry as well
                 await page.goto('https://www.google.com/maps', { waitUntil: 'domcontentloaded', timeout: 30000 });
                 loaded = true;
             }
             catch (e) {
+                logger_1.logger.warn('retry', 'google.com', jobId, { attempt: attempt + 1, error: e.message });
+                metrics_1.metricsService.incrementRetry();
                 console.warn(`[Scraper] Network load issue (attempt ${attempt + 1}): ${e.message}`);
                 await (0, delay_1.randomDelay)(2000, 4000);
             }
         }
-        if (!loaded)
+        if (!loaded) {
+            logger_1.logger.error('timeout', 'google.com', jobId, { message: 'Failed to fully load map DOM after 3 attempts' });
             throw new Error("Failed to load Google Maps after 3 attempts");
+        }
         await (0, delay_1.randomDelay)(minDelay, maxDelay);
         // Accept cookies if present
         try {
@@ -66,6 +79,7 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
                 console.log(`[Scraper] Empty results confirmed.`);
                 return []; // Return empty array naturally
             }
+            logger_1.logger.warn('timeout', 'google.com', jobId, { message: "Timeout waiting for feed panel to attach." });
             throw new Error("Timeout waiting for feed panel to attach.");
         }
         await (0, delay_1.randomDelay)(minDelay, maxDelay);
@@ -146,11 +160,23 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
             }
         }
         console.log(`[Scraper] Discovered total ${placesMap.size} places. Extracting deep details...`);
-        // 5. Navigate to each URL to extract full details including missing phone and website
-        for (const [url, baseData] of Array.from(placesMap.entries())) {
+        // 5. Navigate to each URL to extract full details including missing phone and website concurrently
+        const extractQueue = new p_queue_1.default({ concurrency: 5 }); // 5 concurrent detail tabs per browser
+        await Promise.all(Array.from(placesMap.entries()).map(([url, baseData]) => extractQueue.add(async () => {
             const detailPage = await context.newPage();
             try {
+                const domainMatch = url.match(/^https?:\/\/([^/?#]+)(?:[/?#]|$)/i);
+                const domain = domainMatch ? domainMatch[1] : 'google.com';
+                metrics_1.metricsService.incrementRequest(domain);
+                // Listen for blockages
+                detailPage.on('response', (response) => {
+                    if (response.status() === 429) {
+                        metrics_1.metricsService.incrementBlocked();
+                        logger_1.logger.error('request_blocked', domain, jobId, { url: response.url(), status: 429 });
+                    }
+                });
                 await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                logger_1.logger.info('page_fetched', domain, jobId, { business: baseData.name });
                 // Wait for h1 to load
                 await detailPage.waitForSelector('h1', { timeout: 10000 }).catch(() => { });
                 await (0, delay_1.randomDelay)(1000, 2000);
@@ -212,8 +238,9 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
                 if (merged.website && merged.website.startsWith('/')) {
                     merged.website = "https://www.google.com" + merged.website;
                 }
+                // Use lock mechanism or push safely
                 results.push(merged);
-                console.log(`[Scraper] Extracted details for: ${merged.name}`);
+                console.log(`[Scraper] Extracted details for: ${merged.name} (${extractQueue.size} items left in queue)`);
             }
             catch (e) {
                 console.error(`[Scraper] Failed to extract details for ${url}:`, e);
@@ -231,7 +258,7 @@ const scrapeGoogleMaps = async (context, query, limit = 20) => {
             finally {
                 await detailPage.close().catch(() => { });
             }
-        }
+        })));
     }
     catch (error) {
         console.error(`[Scraper] Error during scraping: ${error}`);

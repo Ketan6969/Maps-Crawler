@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import PQueue from 'p-queue';
 import { browserPool } from '../services/browserPool';
 import { scrapeGoogleMaps } from '../services/mapsScraper';
+import { metricsService } from '../services/metrics';
+import { logger } from '../utils/logger';
 import { Business } from '../types/business';
 
 const router = Router();
@@ -33,20 +35,28 @@ router.post('/search', async (req: Request, res: Response): Promise<void> => {
     }
 
     // Adding job to queue
+    const jobId = Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+    metricsService.createJob(jobId, query);
+    logger.info('job_queued', 'google.com', jobId, { query, limit: parsedLimit });
     console.log(`[API] Queueing search request for: "${query}" (limit: ${parsedLimit})`);
 
     try {
         const results = await queue.add(async (): Promise<Business[]> => {
+            metricsService.updateJobStatus(jobId, 'running');
+
             // 1. Acquire a browser context
             const context = await browserPool.acquireContext();
             try {
                 // 2. Execute scraping job
-                return await scrapeGoogleMaps(context, query, parsedLimit);
+                return await scrapeGoogleMaps(context, query, parsedLimit, jobId);
             } finally {
                 // 3. Always release context back to pool!
                 await browserPool.releaseContext(context);
             }
         });
+
+        metricsService.updateJobStatus(jobId, 'completed');
+        logger.info('crawl_completed', 'google.com', jobId, { count: results?.length });
 
         res.status(200).json({
             query,
@@ -54,7 +64,10 @@ router.post('/search', async (req: Request, res: Response): Promise<void> => {
             results
         });
     } catch (error: any) {
+        metricsService.updateJobStatus(jobId, 'failed');
+        logger.error('crawl_failed', 'google.com', jobId, { error: error.message });
         console.error(`[API] Job failed with error: ${error.message}`);
+
         res.status(500).json({
             error: 'Scraping job failed',
             details: error.message

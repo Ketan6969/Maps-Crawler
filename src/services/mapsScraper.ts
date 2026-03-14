@@ -1,12 +1,16 @@
 import { BrowserContext } from 'playwright';
+import PQueue from 'p-queue';
 import { Business } from '../types/business';
 import { parseBusinessCard } from '../utils/parser';
 import { randomDelay } from '../utils/delay';
+import { logger } from '../utils/logger';
+import { metricsService } from '../services/metrics';
 
 export const scrapeGoogleMaps = async (
     context: BrowserContext,
     query: string,
-    limit: number = 20
+    limit: number = 20,
+    jobId?: string
 ): Promise<Business[]> => {
     const page = await context.newPage();
     const results: Business[] = [];
@@ -20,7 +24,10 @@ export const scrapeGoogleMaps = async (
     const searchDelayMax = 10000;
 
     try {
+        logger.info('crawl_started', 'google.com', jobId, { query, limit });
         console.log(`[Scraper] Starting scrape for query: "${query}" (limit: ${limit})`);
+
+        metricsService.incrementRequest('google.com'); // Track domain rate on main maps search
 
         // Rate limit starting actions
         await randomDelay(searchDelayMin, searchDelayMax);
@@ -29,14 +36,20 @@ export const scrapeGoogleMaps = async (
         let loaded = false;
         for (let attempt = 0; attempt < 3 && !loaded; attempt++) {
             try {
+                metricsService.incrementRequest('google.com'); // Increment on retry as well
                 await page.goto('https://www.google.com/maps', { waitUntil: 'domcontentloaded', timeout: 30000 });
                 loaded = true;
             } catch (e: any) {
+                logger.warn('retry', 'google.com', jobId, { attempt: attempt + 1, error: e.message });
+                metricsService.incrementRetry();
                 console.warn(`[Scraper] Network load issue (attempt ${attempt + 1}): ${e.message}`);
                 await randomDelay(2000, 4000);
             }
         }
-        if (!loaded) throw new Error("Failed to load Google Maps after 3 attempts");
+        if (!loaded) {
+            logger.error('timeout', 'google.com', jobId, { message: 'Failed to fully load map DOM after 3 attempts' });
+            throw new Error("Failed to load Google Maps after 3 attempts");
+        }
 
         await randomDelay(minDelay, maxDelay);
 
@@ -78,6 +91,7 @@ export const scrapeGoogleMaps = async (
                 console.log(`[Scraper] Empty results confirmed.`);
                 return []; // Return empty array naturally
             }
+            logger.warn('timeout', 'google.com', jobId, { message: "Timeout waiting for feed panel to attach." });
             throw new Error("Timeout waiting for feed panel to attach.");
         }
         await randomDelay(minDelay, maxDelay);
@@ -166,93 +180,113 @@ export const scrapeGoogleMaps = async (
 
         console.log(`[Scraper] Discovered total ${placesMap.size} places. Extracting deep details...`);
 
-        // 5. Navigate to each URL to extract full details including missing phone and website
-        for (const [url, baseData] of Array.from(placesMap.entries())) {
-            const detailPage = await context.newPage();
-            try {
-                await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        // 5. Navigate to each URL to extract full details including missing phone and website concurrently
+        const extractQueue = new PQueue({ concurrency: 5 }); // 5 concurrent detail tabs per browser
 
-                // Wait for h1 to load
-                await detailPage.waitForSelector('h1', { timeout: 10000 }).catch(() => { });
-                await randomDelay(1000, 2000);
+        await Promise.all(
+            Array.from(placesMap.entries()).map(([url, baseData]) =>
+                extractQueue.add(async () => {
+                    const detailPage = await context.newPage();
+                    try {
+                        const domainMatch = url.match(/^https?:\/\/([^/?#]+)(?:[/?#]|$)/i);
+                        const domain = domainMatch ? domainMatch[1] : 'google.com';
+                        metricsService.incrementRequest(domain);
 
-                const deepDetails = await detailPage.evaluate(() => {
-                    const phoneNode = document.querySelector('button[data-item-id^="phone:tel:"]');
-                    let phone = null;
-                    if (phoneNode) {
-                        phone = phoneNode.getAttribute('data-item-id')?.replace('phone:tel:', '') || null;
-                        if (!phone || phone.length < 3) phone = phoneNode.getAttribute('aria-label');
-                        if (phone && phone.includes(':')) phone = phone.split(':')[1].trim();
-                        if (!phone) phone = phoneNode.textContent?.trim() || null;
+                        // Listen for blockages
+                        detailPage.on('response', (response) => {
+                            if (response.status() === 429) {
+                                metricsService.incrementBlocked();
+                                logger.error('request_blocked', domain, jobId, { url: response.url(), status: 429 });
+                            }
+                        });
+
+                        await detailPage.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                        logger.info('page_fetched', domain, jobId, { business: baseData.name });
+
+                        // Wait for h1 to load
+                        await detailPage.waitForSelector('h1', { timeout: 10000 }).catch(() => { });
+                        await randomDelay(1000, 2000);
+
+                        const deepDetails = await detailPage.evaluate(() => {
+                            const phoneNode = document.querySelector('button[data-item-id^="phone:tel:"]');
+                            let phone = null;
+                            if (phoneNode) {
+                                phone = phoneNode.getAttribute('data-item-id')?.replace('phone:tel:', '') || null;
+                                if (!phone || phone.length < 3) phone = phoneNode.getAttribute('aria-label');
+                                if (phone && phone.includes(':')) phone = phone.split(':')[1].trim();
+                                if (!phone) phone = phoneNode.textContent?.trim() || null;
+                            }
+
+                            const webNode = document.querySelector('a[data-item-id="authority"], a[data-tooltip="Open website"]');
+                            const website = webNode ? webNode.getAttribute('href') : null;
+
+                            const addrNode = document.querySelector('button[data-item-id="address"], button[data-tooltip="Copy address"]');
+                            let address = addrNode ? addrNode.getAttribute('aria-label') : null;
+                            if (address && address.includes(':')) address = address.split(':')[1].trim();
+                            if (!address && addrNode) address = addrNode.textContent?.trim() || null;
+                            if (address && address.toLowerCase().startsWith('address:')) {
+                                address = address.substring(8).trim();
+                            }
+
+                            // Also grab rating/reviews just in case they were missing from list card
+                            let rating = null;
+                            let reviews = null;
+                            const ratingText = document.querySelector('div.F7nice')?.textContent || '';
+                            if (ratingText) {
+                                const rMatch = ratingText.match(/([\d.]+)/);
+                                if (rMatch) rating = parseFloat(rMatch[1]);
+                                const revMatch = ratingText.replace(/,/g, '').match(/\(([\d]+)\)/);
+                                if (revMatch) reviews = parseInt(revMatch[1], 10);
+                            }
+
+                            const catNode = document.querySelector('button.DkEaL');
+                            let category = catNode ? catNode.textContent?.trim() : null;
+
+                            return { phone, website, address, rating, reviews, category };
+                        });
+
+                        // Merge Data
+                        const merged: Business = {
+                            name: baseData.name || 'Unknown',
+                            rating: baseData.rating || deepDetails.rating,
+                            reviews: baseData.reviews || deepDetails.reviews,
+                            category: baseData.category || deepDetails.category,
+                            phone: deepDetails.phone?.length ? deepDetails.phone : (baseData.phone || null),
+                            website: deepDetails.website?.length ? deepDetails.website : (baseData.website || null),
+                            address: deepDetails.address?.length ? deepDetails.address : (baseData.address || null)
+                        };
+
+                        // Clean up missing strings
+                        if (merged.phone && merged.phone.length < 3) merged.phone = null;
+                        if (merged.website && (merged.website.includes('google.com') || merged.website.length < 5)) merged.website = null;
+
+                        // If the URL has website starting with /, prepend map host
+                        if (merged.website && merged.website.startsWith('/')) {
+                            merged.website = "https://www.google.com" + merged.website;
+                        }
+
+                        // Use lock mechanism or push safely
+                        results.push(merged);
+                        console.log(`[Scraper] Extracted details for: ${merged.name} (${extractQueue.size} items left in queue)`);
+
+                    } catch (e) {
+                        console.error(`[Scraper] Failed to extract details for ${url}:`, e);
+                        // push base data so we don't return nothing
+                        results.push({
+                            name: baseData.name || 'Unknown',
+                            rating: baseData.rating || null,
+                            reviews: baseData.reviews || null,
+                            category: baseData.category || null,
+                            phone: baseData.phone || null,
+                            website: baseData.website || null,
+                            address: baseData.address || null
+                        });
+                    } finally {
+                        await detailPage.close().catch(() => { });
                     }
-
-                    const webNode = document.querySelector('a[data-item-id="authority"], a[data-tooltip="Open website"]');
-                    const website = webNode ? webNode.getAttribute('href') : null;
-
-                    const addrNode = document.querySelector('button[data-item-id="address"], button[data-tooltip="Copy address"]');
-                    let address = addrNode ? addrNode.getAttribute('aria-label') : null;
-                    if (address && address.includes(':')) address = address.split(':')[1].trim();
-                    if (!address && addrNode) address = addrNode.textContent?.trim() || null;
-                    if (address && address.toLowerCase().startsWith('address:')) {
-                        address = address.substring(8).trim();
-                    }
-
-                    // Also grab rating/reviews just in case they were missing from list card
-                    let rating = null;
-                    let reviews = null;
-                    const ratingText = document.querySelector('div.F7nice')?.textContent || '';
-                    if (ratingText) {
-                        const rMatch = ratingText.match(/([\d.]+)/);
-                        if (rMatch) rating = parseFloat(rMatch[1]);
-                        const revMatch = ratingText.replace(/,/g, '').match(/\(([\d]+)\)/);
-                        if (revMatch) reviews = parseInt(revMatch[1], 10);
-                    }
-
-                    const catNode = document.querySelector('button.DkEaL');
-                    let category = catNode ? catNode.textContent?.trim() : null;
-
-                    return { phone, website, address, rating, reviews, category };
-                });
-
-                // Merge Data
-                const merged: Business = {
-                    name: baseData.name || 'Unknown',
-                    rating: baseData.rating || deepDetails.rating,
-                    reviews: baseData.reviews || deepDetails.reviews,
-                    category: baseData.category || deepDetails.category,
-                    phone: deepDetails.phone?.length ? deepDetails.phone : (baseData.phone || null),
-                    website: deepDetails.website?.length ? deepDetails.website : (baseData.website || null),
-                    address: deepDetails.address?.length ? deepDetails.address : (baseData.address || null)
-                };
-
-                // Clean up missing strings
-                if (merged.phone && merged.phone.length < 3) merged.phone = null;
-                if (merged.website && (merged.website.includes('google.com') || merged.website.length < 5)) merged.website = null;
-
-                // If the URL has website starting with /, prepend map host
-                if (merged.website && merged.website.startsWith('/')) {
-                    merged.website = "https://www.google.com" + merged.website;
-                }
-
-                results.push(merged);
-                console.log(`[Scraper] Extracted details for: ${merged.name}`);
-
-            } catch (e) {
-                console.error(`[Scraper] Failed to extract details for ${url}:`, e);
-                // push base data so we don't return nothing
-                results.push({
-                    name: baseData.name || 'Unknown',
-                    rating: baseData.rating || null,
-                    reviews: baseData.reviews || null,
-                    category: baseData.category || null,
-                    phone: baseData.phone || null,
-                    website: baseData.website || null,
-                    address: baseData.address || null
-                });
-            } finally {
-                await detailPage.close().catch(() => { });
-            }
-        }
+                })
+            )
+        );
 
     } catch (error) {
         console.error(`[Scraper] Error during scraping: ${error}`);

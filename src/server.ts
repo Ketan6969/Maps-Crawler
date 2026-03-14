@@ -1,6 +1,8 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import mapsRouter from './routes/maps';
+import monitoringRouter from './routes/monitoring';
+import { logger } from './utils/logger';
 import { browserPool } from './services/browserPool';
 
 dotenv.config();
@@ -10,13 +12,11 @@ const PORT = process.env.PORT || 3000;
 
 app.use(express.json());
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok' });
-});
-
 // Maps Scraping API
 app.use('/maps', mapsRouter);
+
+// Monitoring / Metrics API
+app.use('/', monitoringRouter);
 
 // Global error handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -33,6 +33,7 @@ const startServer = async () => {
         app.listen(PORT, () => {
             console.log(`[Server] Listening on port ${PORT}`);
             console.log(`[Server] Press Ctrl+C to stop`);
+            logger.info('app_start', undefined, undefined, { port: PORT });
         });
     } catch (error) {
         console.error('[Server] Failed to initialize:', error);

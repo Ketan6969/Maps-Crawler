@@ -1,7 +1,7 @@
 "use strict";
 async function runTests() {
     console.log("Starting Rigorous API Tests...\n");
-    const baseUrl = 'http://localhost:3000';
+    const baseUrl = 'http://localhost:3001';
     // Helper
     const hitSearch = async (query, limit) => {
         const body = limit ? { query, limit } : { query };

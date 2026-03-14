@@ -6,17 +6,17 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const maps_1 = __importDefault(require("./routes/maps"));
+const monitoring_1 = __importDefault(require("./routes/monitoring"));
+const logger_1 = require("./utils/logger");
 const browserPool_1 = require("./services/browserPool");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3000;
 app.use(express_1.default.json());
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'ok' });
-});
 // Maps Scraping API
 app.use('/maps', maps_1.default);
+// Monitoring / Metrics API
+app.use('/', monitoring_1.default);
 // Global error handler
 app.use((err, req, res, next) => {
     console.error('[Server] Unhandled error:', err);
@@ -30,6 +30,7 @@ const startServer = async () => {
         app.listen(PORT, () => {
             console.log(`[Server] Listening on port ${PORT}`);
             console.log(`[Server] Press Ctrl+C to stop`);
+            logger_1.logger.info('app_start', undefined, undefined, { port: PORT });
         });
     }
     catch (error) {

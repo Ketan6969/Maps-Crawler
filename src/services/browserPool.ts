@@ -81,6 +81,16 @@ class BrowserPool {
         // Mask webdriver and inject stealth properties
         await context.addInitScript(stealthScript);
 
+        // Block resources to save RAM and network bandwidth
+        await context.route('**/*', (route) => {
+            const resourceType = route.request().resourceType();
+            if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+                route.abort();
+            } else {
+                route.continue();
+            }
+        });
+
         this.browsers.push({
             browser,
             context,
